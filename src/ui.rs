@@ -324,7 +324,7 @@ fn account_actions(
                 .id("login")
                 .child(label.to_string())
                 .on_click(login),
-            quit: segment().id("quit").child("退出拾刻").on_click(quit),
+            quit: segment().id("quit").child("退出登录").on_click(quit),
         }),
     )
 }
@@ -420,7 +420,7 @@ pub struct Desk {
     handle: usize,
     demo: bool,
     power_busy: bool,
-    restart: HashSet<u64>,
+    stopping: HashSet<u64>,
 }
 impl Desk {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, demo: bool) -> Self {
@@ -436,7 +436,9 @@ impl Desk {
         };
         if demo {
             saved = Store {
-                user_name: "B站用户".into(),
+                user_name: "演示账号".into(),
+                user_id: 1,
+                cookie: "demo-session".into(),
                 ..Default::default()
             };
             for (i, title) in [
@@ -453,11 +455,18 @@ impl Desk {
                 saved.tasks[i].message = "等待零点".into();
             }
             saved.archive(3, "领取成功 · 已发送站内信".into(), None);
+            saved.tasks[1].owner_id = 2;
+            saved.tasks[1].owner_name = "另一个账号".into();
+            saved.tasks[1].state = TaskState::WaitingLogin;
         }
         let (tx, rx) = mpsc::channel();
         let tray = make_tray();
         let can_hide = tray.is_some();
-        window.set_window_title("拾刻");
+        window.set_window_title(if demo {
+            "拾刻 · 界面预览"
+        } else {
+            "拾刻"
+        });
         window.on_window_should_close(cx, move |w, cx| {
             if can_hide {
                 hide_native(hwnd(w));
@@ -497,7 +506,7 @@ impl Desk {
             handle: hwnd(window),
             demo,
             power_busy: false,
-            restart: HashSet::new(),
+            stopping: HashSet::new(),
         }
     }
     fn save(&mut self) {
@@ -540,15 +549,29 @@ impl Desk {
             .unwrap_or_default();
         for e in logins {
             match e {
-                LoginEvent::Status(s) => self.notice = s,
+                LoginEvent::Status(s) => {
+                    if !self
+                        .login_cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Acquire))
+                    {
+                        self.notice = s;
+                    }
+                }
                 LoginEvent::Done(r) => {
+                    let canceled = self
+                        .login_cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Acquire));
                     self.login_cancel = None;
                     self.login_rx = None;
+                    if canceled {
+                        continue;
+                    }
                     match r {
                         Ok((c, n, m)) => {
-                            self.store.cookie = c;
-                            self.store.user_name = n;
-                            self.store.user_id = m;
+                            self.stop_session_workers();
+                            self.store.sign_in(c, n, m, chrono::Utc::now().timestamp());
                             self.notice = "登录成功".into();
                             self.save();
                         }
@@ -560,61 +583,13 @@ impl Desk {
         let events: Vec<_> = self.rx.try_iter().collect();
         let mut changed = false;
         for e in events {
-            if let Event::Finished(id) = e {
+            let id = e.task_id();
+            if matches!(e, Event::Finished(_)) {
                 self.active.remove(&id);
-                if self.restart.remove(&id) {
-                    if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
-                        if t.state != TaskState::Archived {
-                            t.state = TaskState::Pending;
-                            changed = true;
-                        }
-                    }
-                }
+                self.stopping.remove(&id);
                 continue;
             }
-            if let Event::Archive(id, m, k) = e {
-                self.store.archive(id, m, k);
-                changed = true;
-                continue;
-            }
-            let id = match &e {
-                Event::Prepared(id, _)
-                | Event::Waiting(id)
-                | Event::Started(id)
-                | Event::Attempt(id, ..)
-                | Event::Message(id, _)
-                | Event::Failed(id, _)
-                | Event::Paused(id) => *id,
-                _ => continue,
-            };
-            if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
-                if t.state == TaskState::Archived {
-                    continue;
-                }
-                match e {
-                    Event::Prepared(_, title) => t.title = title,
-                    Event::Waiting(_) => {
-                        t.state = TaskState::Waiting;
-                        t.message = "等待执行".into();
-                    }
-                    Event::Started(_) => {
-                        t.state = TaskState::Running;
-                        t.message = "正在领取".into();
-                    }
-                    Event::Attempt(_, w, n) => t.attempts[w] = n,
-                    Event::Message(_, m) => t.message = m,
-                    Event::Failed(_, m) => {
-                        t.state = TaskState::Failed;
-                        t.message = m;
-                    }
-                    Event::Paused(_) => {
-                        t.state = TaskState::Paused;
-                        t.message = "已暂停".into();
-                    }
-                    _ => {}
-                }
-                changed = true;
-            }
+            changed |= self.store.apply_event(&e, self.stopping.contains(&id));
         }
         if changed {
             self.save();
@@ -624,7 +599,11 @@ impl Desk {
                 .store
                 .tasks
                 .iter()
-                .filter(|t| t.state == TaskState::Pending && !self.active.contains_key(&t.id))
+                .filter(|t| {
+                    t.state == TaskState::Pending
+                        && self.store.can_run(t)
+                        && !self.active.contains_key(&t.id)
+                })
                 .cloned()
                 .collect();
             for t in ready {
@@ -670,6 +649,22 @@ impl Desk {
         }
         cx.notify();
     }
+    fn stop_session_workers(&mut self) {
+        for (id, cancel) in &self.active {
+            cancel.store(true, Ordering::Release);
+            self.stopping.insert(*id);
+        }
+    }
+    fn logout(&mut self, cx: &mut Context<Self>) {
+        self.stop_session_workers();
+        if let Some(cancel) = &self.login_cancel {
+            cancel.store(true, Ordering::Release);
+        }
+        self.store.sign_out();
+        self.notice = "已退出登录，领取安排和记录已保留。".into();
+        self.save();
+        cx.notify();
+    }
     fn quit(&mut self, cx: &mut Context<Self>) {
         self.save();
         for c in self.active.values() {
@@ -696,6 +691,16 @@ impl Desk {
     }
     fn edit(&mut self, id: u64, w: &mut Window, cx: &mut Context<Self>) {
         if let Some(t) = self.store.tasks.iter().find(|t| t.id == id).cloned() {
+            if t.state == TaskState::Archived {
+                self.notice = "这份奖励已经领取，请在领取记录中查看。".into();
+                cx.notify();
+                return;
+            }
+            if self.active.contains_key(&id) && t.target <= chrono::Utc::now().timestamp() {
+                self.notice = "正在确认领取结果，请稍后再修改。".into();
+                cx.notify();
+                return;
+            }
             self.editing = Some(id);
             self.time_choice = TimeChoice::Custom;
             self.link_error.clear();
@@ -717,6 +722,21 @@ impl Desk {
         let link = self.link.read(cx).content.to_string();
         self.link_error.clear();
         self.time_error.clear();
+        if let Some(task) = self
+            .editing
+            .and_then(|id| self.store.tasks.iter().find(|t| t.id == id))
+        {
+            if task.state == TaskState::Archived {
+                self.link_error = "这份奖励已经领取，请在领取记录中查看。".into();
+                cx.notify();
+                return;
+            }
+            if self.active.contains_key(&task.id) && task.target <= chrono::Utc::now().timestamp() {
+                self.link_error = "正在确认领取结果，请稍后再修改。".into();
+                cx.notify();
+                return;
+            }
+        }
         let tid = match store::parse_task_id(&link) {
             Ok(id) => id,
             Err(e) => {
@@ -725,8 +745,27 @@ impl Desk {
                 return;
             }
         };
+        let owner = self
+            .editing
+            .and_then(|id| self.store.tasks.iter().find(|t| t.id == id))
+            .map(|t| t.owner_id)
+            .unwrap_or(self.store.user_id);
+        if self.editing.is_none() && !self.store.is_logged_in() {
+            self.link_error = "请先登录B站，再添加奖励。".into();
+            cx.notify();
+            return;
+        }
+        if self.time_choice == TimeChoice::Now
+            && (!self.store.is_logged_in() || owner != self.store.user_id)
+        {
+            self.time_error = "请先登录这份奖励所属的账号，再选择现在领取。".into();
+            cx.notify();
+            return;
+        }
         if let Some(old) = self.store.tasks.iter().find(|t| {
-            t.task_id == tid && (Some(t.id) != self.editing || t.state == TaskState::Archived)
+            t.task_id == tid
+                && t.owner_id == owner
+                && (Some(t.id) != self.editing || t.state == TaskState::Archived)
         }) {
             self.link_error = if old.state == TaskState::Archived {
                 "这份奖励已经领过了，可在领取记录中查看。"
@@ -761,13 +800,18 @@ impl Desk {
         if let Some(id) = self.editing {
             if let Some(c) = self.active.get(&id) {
                 c.store(true, Ordering::Release);
-                self.restart.insert(id);
+                self.stopping.insert(id);
             }
             if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
                 t.url = link;
                 t.task_id = tid;
                 t.target = target;
-                t.state = TaskState::Pending;
+                t.state =
+                    if owner != 0 && owner == self.store.user_id && !self.store.cookie.is_empty() {
+                        TaskState::Pending
+                    } else {
+                        TaskState::WaitingLogin
+                    };
                 t.attempts = [0; 2];
                 t.message = "等待准备".into();
             }
@@ -783,14 +827,31 @@ impl Desk {
         cx.notify();
     }
     fn toggle(&mut self, id: u64, cx: &mut Context<Self>) {
-        if let Some(c) = self.active.get(&id) {
-            c.store(true, Ordering::Release);
-            if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
-                t.message = "正在停止".into();
+        let Some(task) = self.store.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        if !self.store.can_run(&task) {
+            self.notice = format!("请先登录“{}”，再继续领取。", task.owner_name);
+            cx.notify();
+            return;
+        }
+        if let Some(cancel) = self.active.get(&id) {
+            cancel.store(true, Ordering::Release);
+            self.stopping.insert(id);
+        }
+        if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
+            if task.state == TaskState::Paused {
+                if t.target <= chrono::Utc::now().timestamp() {
+                    t.state = TaskState::Failed;
+                    t.message = "已错过执行时间，请重新设置".into();
+                } else {
+                    t.state = TaskState::Pending;
+                    t.message = "等待准备".into();
+                }
+            } else {
+                t.state = TaskState::Paused;
+                t.message = "已暂停".into();
             }
-        } else if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
-            t.state = TaskState::Pending;
-            t.message = "等待准备".into();
         }
         self.save();
         cx.notify();
@@ -813,7 +874,7 @@ impl Desk {
         let id = t.id;
         let archived = t.state == TaskState::Archived;
         let failed = t.state == TaskState::Failed;
-        let running = self.active.contains_key(&id);
+        let running = self.active.contains_key(&id) && !self.stopping.contains(&id);
         let paused = t.state == TaskState::Paused;
         let (url, cdk) = (t.url.clone(), t.cdkey.clone());
         let (label, color) = match t.state {
@@ -822,6 +883,14 @@ impl Desk {
             {
                 ("等待登录", MUTED)
             }
+            TaskState::WaitingLogin => (
+                if self.store.is_logged_in() {
+                    "等待登录该账号"
+                } else {
+                    "等待登录"
+                },
+                MUTED,
+            ),
             TaskState::Pending | TaskState::Preparing => ("准备中", MUTED),
             TaskState::Waiting => ("已安排", BLUE),
             TaskState::Running => ("领取中", BLUE),
@@ -890,7 +959,15 @@ impl Desk {
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(MUTED))
-                            .child(detail),
+                            .text_ellipsis()
+                            .child(format!(
+                                "{} · {detail}",
+                                if t.owner_name.is_empty() {
+                                    "待确认账号"
+                                } else {
+                                    &t.owner_name
+                                }
+                            )),
                     )
                     .when(failed, |el| {
                         el.child(
@@ -955,8 +1032,14 @@ impl Desk {
     }
     fn modal(&self, cx: &mut Context<Self>) -> Div {
         let editing = self.editing.is_some();
-        let login_required =
-            self.time_choice == TimeChoice::Now && self.store.cookie.is_empty() && !self.demo;
+        let task_owner = self
+            .editing
+            .and_then(|id| self.store.tasks.iter().find(|t| t.id == id));
+        let login_required = if let Some(task) = task_owner {
+            self.time_choice == TimeChoice::Now && !self.store.can_run(task)
+        } else {
+            !self.store.is_logged_in()
+        };
         let time_note = match self.time_choice {
             TimeChoice::Midnight => format!(
                 "{} · 北京时间",
@@ -1016,7 +1099,17 @@ impl Desk {
                                 div()
                                     .text_size(px(13.))
                                     .text_color(rgb(MUTED))
-                                    .child("选好奖励和时间，到点自动领取。"),
+                                    .child(format!(
+                                        "所属账号：{}",
+                                        task_owner
+                                            .map(|t| t.owner_name.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or(if self.store.is_logged_in() {
+                                                &self.store.user_name
+                                            } else {
+                                                "登录后确定"
+                                            })
+                                    )),
                             ),
                     )
                     .child(
@@ -1177,13 +1270,13 @@ impl Render for Desk {
             .count();
         let archived = self.store.tasks.len() - pending;
         let now = chrono::Utc::now().timestamp();
-        let logged = !self.store.cookie.is_empty() || self.demo;
+        let logged = self.store.is_logged_in();
         let login_busy = self.login_cancel.is_some();
         let claiming = self
             .store
             .tasks
             .iter()
-            .any(|t| t.state == TaskState::Running);
+            .any(|t| t.state == TaskState::Running && self.store.can_run(t));
         let next = self
             .store
             .tasks
@@ -1192,7 +1285,8 @@ impl Render for Desk {
                 matches!(
                     t.state,
                     TaskState::Pending | TaskState::Waiting | TaskState::Preparing
-                ) && t.target > now
+                ) && self.store.can_run(t)
+                    && t.target > now
             })
             .map(|t| t.target)
             .min()
@@ -1228,8 +1322,13 @@ impl Render for Desk {
             .any(|t| t.state == TaskState::Paused)
         {
             "领取已暂停，可在下方继续。".into()
-        } else if !logged && pending > 0 {
-            "奖励已安排，登录B站后即可自动领取。".into()
+        } else if self
+            .store
+            .tasks
+            .iter()
+            .any(|t| t.state == TaskState::WaitingLogin)
+        {
+            "登录对应账号后，未到期的奖励会自动恢复。".into()
         } else {
             "添加奖励链接，选好时间，到点自动领取。".into()
         };
@@ -1308,7 +1407,7 @@ impl Render for Desk {
                                     "登录B站"
                                 },
                                 cx.listener(|v, _, _, cx| v.login(cx)),
-                                cx.listener(|v, _, _, cx| v.quit(cx)),
+                                cx.listener(|v, _, _, cx| v.logout(cx)),
                             )),
                     ),
             )

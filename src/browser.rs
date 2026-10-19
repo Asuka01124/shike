@@ -80,7 +80,7 @@ pub fn login(
             "--no-first-run",
             "--no-default-browser-check",
             "--new-window",
-            "https://passport.bilibili.com/login?gourl=https%3A%2F%2Fwww.bilibili.com%2F",
+            "about:blank",
         ])
         .spawn()
         .context("无法打开登录浏览器")?;
@@ -116,7 +116,17 @@ pub fn login(
     if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     }
-    let mut id = 0;
+    // 独立浏览器每次重新登录都先清除旧会话，确保可以选择其他账号。
+    command(&mut socket, 1, "Storage.clearCookies", json!({}))?;
+    command(
+        &mut socket,
+        2,
+        "Target.createTarget",
+        json!({
+            "url": "https://passport.bilibili.com/login?gourl=https%3A%2F%2Fwww.bilibili.com%2F"
+        }),
+    )?;
+    let mut id = 2;
     while Instant::now() < deadline {
         if cancel.load(Ordering::Acquire) {
             close(&mut socket, &mut child, id + 1);
@@ -208,9 +218,29 @@ mod tests {
         }
         let info = command(&mut socket, 1, "Browser.getVersion", json!({})).unwrap();
         assert!(info["product"].as_str().unwrap().contains("Chrome"));
-        let cookies = command(&mut socket, 2, "Storage.getCookies", json!({})).unwrap();
+        command(&mut socket, 2, "Storage.setCookies", json!({"cookies":[{
+            "name":"shike-test-session", "value":"old-account", "url":"https://www.bilibili.com/"
+        }]})).unwrap();
+        let old = command(&mut socket, 3, "Storage.getCookies", json!({})).unwrap();
+        assert!(
+            old["cookies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == "shike-test-session")
+        );
+        command(&mut socket, 4, "Storage.clearCookies", json!({})).unwrap();
+        let cookies = command(&mut socket, 5, "Storage.getCookies", json!({})).unwrap();
         assert_eq!(cookies["cookies"].as_array().unwrap().len(), 0);
-        close(&mut socket, &mut child, 3);
+        let target = command(
+            &mut socket,
+            6,
+            "Target.createTarget",
+            json!({"url":"about:blank"}),
+        )
+        .unwrap();
+        assert!(target["targetId"].as_str().is_some());
+        close(&mut socket, &mut child, 7);
         let _ = child.wait();
         // 测试配置单独存放在临时目录；不读取或覆盖用户的浏览器配置。
     }

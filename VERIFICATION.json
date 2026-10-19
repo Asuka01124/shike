@@ -2,7 +2,7 @@
   "completedOn": "2026-10-19",
   "rust": "1.94.1",
   "gpui": "0.2.2",
-  "releaseExeBytes": 15639552,
+  "releaseExeBytes": 15659520,
   "unitTests": 11,
   "schedulingIntegrationTests": 1,
   "uiChecks": [
@@ -27,7 +27,11 @@
     "首页三个操作采用浅灰底色",
     "账号操作统一分段滑块",
     "滑块右移及移出复位像素验证",
-    "列表修改及暂停继续操作统一浅灰小卡片"
+    "列表修改及暂停继续操作统一浅灰小卡片",
+    "任务时间旁显示所属账号",
+    "退出登录保留窗口任务及记录",
+    "不同账号显示等待登录该账号",
+    "真实旧账号任务归属迁移"
   ],
   "liveAnonymousApi": {
     "task": "6ERAcwloghvoka00",
@@ -36,7 +40,7 @@
     "status": 8
   },
   "realClaimRequests": 0,
-  "sha256": "CF679753A397E55D50A265954F1A98F7E3246F552B05FD8766306646C3EA7FA6",
+  "sha256": "FFA118F56975512DD880D4B65C7C64C6C35BEBE11510CF961995D88CDE68A01C",
   "hoverCheck": {
     "durationMs": 140,
     "offsetPixels": -2,
@@ -85,5 +89,20 @@
     "durationMs": 140,
     "hoverLiftPixels": 2,
     "verification": "output/slider-check/verification.json"
+  },
+  "accountIntegrationTests": 9,
+  "accountBehavior": {
+    "schemaVersion": 2,
+    "logoutPreservesTasks": true,
+    "sameAccountResumesFutureOnly": true,
+    "manualPausePreserved": true,
+    "wrongAccountRejectedBeforeClaim": true,
+    "inflightResultKeptWithOriginalAccount": true,
+    "browserLoginClearsOldSession": true,
+    "preview": "output/account-check/logged-out.png",
+    "recordPreview": "output/account-check/records-after-logout.png",
+    "realMigrationVerified": true,
+    "existingLoginAndSchedulePreserved": true,
+    "inflightIdentityCannotBeEdited": true
   }
 }

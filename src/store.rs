@@ -13,6 +13,7 @@ pub enum TaskState {
     Preparing,
     Waiting,
     Running,
+    WaitingLogin,
     Paused,
     Failed,
     Archived,
@@ -26,6 +27,10 @@ pub struct Task {
     pub target: i64,
     pub state: TaskState,
     #[serde(default)]
+    pub owner_id: u64,
+    #[serde(default)]
+    pub owner_name: String,
+    #[serde(default)]
     pub attempts: [u32; 2],
     #[serde(default)]
     pub message: String,
@@ -37,6 +42,7 @@ pub struct Task {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Store {
+    pub schema_version: u32,
     pub cookie: String,
     pub user_name: String,
     pub user_id: u64,
@@ -59,14 +65,31 @@ impl Store {
             return Ok(Self::default());
         }
         let mut store: Self = serde_json::from_slice(&fs::read(file)?)?;
+        if store.schema_version < 2 {
+            store.bind_legacy_tasks();
+            store.schema_version = 2;
+        }
+        let current = if store.is_logged_in() {
+            store.user_id
+        } else {
+            0
+        };
         for task in &mut store.tasks {
             if matches!(
                 task.state,
                 TaskState::Preparing | TaskState::Waiting | TaskState::Running
             ) {
-                task.state = TaskState::Pending;
+                task.state = if current != 0 && task.owner_id == current {
+                    TaskState::Pending
+                } else {
+                    TaskState::WaitingLogin
+                };
+            } else if task.state == TaskState::Pending && (current == 0 || task.owner_id != current)
+            {
+                task.state = TaskState::WaitingLogin;
             }
         }
+        store.resume_login_tasks(Utc::now().timestamp());
         Ok(store)
     }
     pub fn save(&self, dir: &Path) -> Result<()> {
@@ -76,14 +99,29 @@ impl Store {
         fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
         // Windows不能原子覆盖已存在的文件；保留上一次可用副本。
         if file.exists() {
-            fs::copy(&file, dir.join("tasks.backup.json"))?;
+            if self.cookie.is_empty() {
+                // 退出后备份也只保留不含登录凭据的快照。
+                fs::write(
+                    dir.join("tasks.backup.json"),
+                    serde_json::to_vec_pretty(self)?,
+                )?;
+            } else {
+                fs::copy(&file, dir.join("tasks.backup.json"))?;
+            }
         }
         fs::rename(&temporary, &file).or_else(|_| fs::copy(&temporary, &file).map(|_| ()))?;
         Ok(())
     }
     pub fn add(&mut self, link: &str, target: i64) -> Result<u64> {
+        if !self.is_logged_in() {
+            bail!("请先登录B站，再添加奖励");
+        }
         let task_id = parse_task_id(link)?;
-        if let Some(old) = self.tasks.iter().find(|t| t.task_id == task_id) {
+        if let Some(old) = self
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_id && t.owner_id == self.user_id)
+        {
             bail!(
                 "{}",
                 if old.state == TaskState::Archived {
@@ -103,12 +141,127 @@ impl Store {
             title: "新领取任务".into(),
             target,
             state: TaskState::Pending,
+            owner_id: self.user_id,
+            owner_name: self.user_name.clone(),
             attempts: [0; 2],
             message: "等待准备".into(),
             cdkey: None,
             archived_at: None,
         });
         Ok(id)
+    }
+    pub fn is_logged_in(&self) -> bool {
+        self.user_id != 0 && !self.cookie.is_empty()
+    }
+    pub fn can_run(&self, task: &Task) -> bool {
+        self.is_logged_in() && task.owner_id != 0 && task.owner_id == self.user_id
+    }
+    fn bind_legacy_tasks(&mut self) {
+        if self.user_id == 0 {
+            return;
+        }
+        for task in &mut self.tasks {
+            if task.owner_id == 0 {
+                task.owner_id = self.user_id;
+                task.owner_name = self.user_name.clone();
+            }
+        }
+    }
+    fn resume_login_tasks(&mut self, now: i64) {
+        if !self.is_logged_in() {
+            return;
+        }
+        for task in &mut self.tasks {
+            if task.owner_id != self.user_id {
+                continue;
+            }
+            task.owner_name = self.user_name.clone();
+            if task.state == TaskState::WaitingLogin {
+                if task.target <= now {
+                    task.state = TaskState::Failed;
+                    task.message = "已错过执行时间，请重新设置".into();
+                } else {
+                    task.state = TaskState::Pending;
+                    task.message = "等待准备".into();
+                }
+            }
+        }
+    }
+    pub fn sign_out(&mut self) {
+        self.cookie.clear();
+        self.user_name.clear();
+        self.user_id = 0;
+        for task in &mut self.tasks {
+            if matches!(
+                task.state,
+                TaskState::Pending | TaskState::Preparing | TaskState::Waiting | TaskState::Running
+            ) {
+                task.state = TaskState::WaitingLogin;
+                task.message = "等待登录该账号".into();
+            }
+        }
+    }
+    pub fn sign_in(&mut self, cookie: String, name: String, user_id: u64, now: i64) {
+        self.sign_out();
+        self.schema_version = 2;
+        self.cookie = cookie;
+        self.user_name = name;
+        self.user_id = user_id;
+        // 旧版未登录时添加的奖励在首次明确登录后绑定；未知归属的历史记录不重新分配。
+        for task in &mut self.tasks {
+            if task.owner_id == 0 && task.state != TaskState::Archived {
+                task.owner_id = user_id;
+                task.owner_name = self.user_name.clone();
+            }
+        }
+        self.resume_login_tasks(now);
+    }
+    pub fn apply_event(&mut self, event: &crate::engine::Event, stopping: bool) -> bool {
+        use crate::engine::Event;
+        let id = event.task_id();
+        if let Event::Archive(_, message, key) = event {
+            self.archive(id, message.clone(), key.clone());
+            return true;
+        }
+        let eligible = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| self.can_run(t));
+        let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) else {
+            return false;
+        };
+        if task.state == TaskState::Archived {
+            return false;
+        }
+        // 已发出的领取即使在退出后返回，也保留真实结果；准备过程的取消由引擎报告暂停。
+        if let Event::Failed(_, message) = event {
+            task.state = TaskState::Failed;
+            task.message = message.clone();
+            return true;
+        }
+        if stopping || !eligible || task.state == TaskState::WaitingLogin {
+            return false;
+        }
+        match event {
+            Event::Prepared(_, title) => task.title = title.clone(),
+            Event::Waiting(_) => {
+                task.state = TaskState::Waiting;
+                task.message = "等待执行".into();
+            }
+            Event::Started(_) => {
+                task.state = TaskState::Running;
+                task.message = "正在领取".into();
+            }
+            Event::Attempt(_, worker, number) => task.attempts[*worker] = *number,
+            Event::Message(_, message) => task.message = message.clone(),
+            Event::Paused(_) => {
+                task.state = TaskState::Paused;
+                task.message = "已暂停".into();
+            }
+            _ => return false,
+        }
+        true
     }
     pub fn archive(&mut self, id: u64, message: String, cdkey: Option<String>) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
@@ -170,6 +323,12 @@ mod tests {
     #[test]
     fn duplicate_and_archive() {
         let mut s = Store::default();
+        s.sign_in(
+            "test-session".into(),
+            "测试账号".into(),
+            1,
+            Utc::now().timestamp(),
+        );
         let link = "https://www.bilibili.com/blackboard/era/award-exchange.html?task_id=demo";
         let id = s.add(link, 123).unwrap();
         assert!(s.add(link, 456).is_err());
@@ -200,6 +359,12 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap()
         ));
         let mut s = Store::default();
+        s.sign_in(
+            "test-session".into(),
+            "测试账号".into(),
+            1,
+            Utc::now().timestamp(),
+        );
         let id = s
             .add("https://www.bilibili.com/?task_id=archived", 123)
             .unwrap();

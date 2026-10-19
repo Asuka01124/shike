@@ -29,6 +29,8 @@ fn multiple_links_start_at_target_and_archive_only_on_success() {
         let mut handlers = Vec::new();
         while !stop.load(Ordering::Acquire) {
             if let Ok((mut s, _)) = listener.accept() {
+                // Windows 接受的连接可能继承监听器的非阻塞模式。
+                s.set_nonblocking(false).unwrap();
                 let log = log.clone();
                 handlers.push(thread::spawn(move||{
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();let mut buf=Vec::new();let mut chunk=[0u8;2048];let end;
@@ -57,6 +59,12 @@ fn multiple_links_start_at_target_and_archive_only_on_success() {
     });
     let target = chrono::Utc::now().timestamp() + 2;
     let mut store = Store::default();
+    store.sign_in(
+        "test-session".into(),
+        "测试用户".into(),
+        1,
+        chrono::Utc::now().timestamp(),
+    );
     for id in ["one", "two"] {
         store
             .add(

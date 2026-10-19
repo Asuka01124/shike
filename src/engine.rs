@@ -25,6 +25,21 @@ pub enum Event {
     Paused(u64),
     Finished(u64),
 }
+impl Event {
+    pub fn task_id(&self) -> u64 {
+        match self {
+            Self::Prepared(id, _)
+            | Self::Waiting(id)
+            | Self::Started(id)
+            | Self::Attempt(id, ..)
+            | Self::Message(id, _)
+            | Self::Archive(id, ..)
+            | Self::Failed(id, _)
+            | Self::Paused(id)
+            | Self::Finished(id) => *id,
+        }
+    }
+}
 type ClaimFn = dyn Fn(usize, u32) -> Result<ClaimReply> + Send + Sync;
 fn pause_until(deadline: Instant, cancel: &AtomicBool) {
     while Instant::now() < deadline && !cancel.load(Ordering::Acquire) {
@@ -133,8 +148,20 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
     thread::spawn(move || {
         let id = task.id;
         let result = (|| -> Result<()> {
-            api.account()?;
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let (_, account_id) = api.account()?;
+            if task.owner_id == 0 || task.owner_id != account_id {
+                anyhow::bail!("请登录这份奖励所属的账号后再领取");
+            }
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let award = api.award_info(&task.task_id)?;
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let title = format!("{} · {}", award.task_name, award.reward_name);
             let _ = tx.send(Event::Prepared(id, title));
             if award.status == 6 {
@@ -177,7 +204,11 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
             Ok(())
         })();
         if let Err(error) = result {
-            let _ = tx.send(Event::Failed(id, error.to_string()));
+            let _ = tx.send(if stop.load(Ordering::Acquire) {
+                Event::Paused(id)
+            } else {
+                Event::Failed(id, error.to_string())
+            });
         }
         let _ = tx.send(Event::Finished(id));
     });
