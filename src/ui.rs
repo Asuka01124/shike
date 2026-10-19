@@ -1,6 +1,7 @@
 use crate::input::{self, TextInput};
 use gpui::{prelude::*, *};
 use shike::{
+    api::Api,
     browser,
     engine::{self, Event},
     store::{self, Store, Task, TaskState},
@@ -397,6 +398,7 @@ pub struct Desk {
     tx: Sender<Event>,
     rx: Receiver<Event>,
     active: HashMap<u64, Arc<AtomicBool>>,
+    session_api: Option<Api>,
     login_rx: Option<Receiver<LoginEvent>>,
     login_cancel: Option<Arc<AtomicBool>>,
     tray: Option<Tray>,
@@ -441,6 +443,8 @@ impl Desk {
             saved.tasks[1].owner_id = 2;
             saved.tasks[1].owner_name = "另一个账号".into();
             saved.tasks[1].state = TaskState::WaitingLogin;
+            saved.tasks[0].state = TaskState::CoolingDown;
+            saved.tasks[0].message = "暂时受限，稍后自动继续".into();
         }
         let (tx, rx) = mpsc::channel();
         let tray = make_tray();
@@ -483,6 +487,7 @@ impl Desk {
             tx,
             rx,
             active: HashMap::new(),
+            session_api: None,
             login_rx: None,
             login_cancel: None,
             tray,
@@ -583,7 +588,7 @@ impl Desk {
                 .tasks
                 .iter()
                 .filter(|t| {
-                    t.state == TaskState::Pending
+                    matches!(t.state, TaskState::Pending | TaskState::CoolingDown)
                         && self.store.can_run(t)
                         && !self.active.contains_key(&t.id)
                 })
@@ -591,14 +596,35 @@ impl Desk {
                 .collect();
             for t in ready {
                 let id = t.id;
-                if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
-                    t.state = TaskState::Preparing;
-                    t.message = "准备奖励信息".into();
+                if self.session_api.is_none() {
+                    match Api::new(&self.store.cookie) {
+                        Ok(api) => self.session_api = Some(api),
+                        Err(error) => {
+                            self.store
+                                .apply_event(&Event::Failed(id, error.to_string()), false);
+                            self.save();
+                            continue;
+                        }
+                    }
                 }
-                self.active.insert(
-                    id,
-                    engine::start(t, self.store.cookie.clone(), self.tx.clone()),
-                );
+                let api = self.session_api.as_ref().unwrap().clone();
+                let until = self
+                    .store
+                    .tasks
+                    .iter()
+                    .filter(|t| t.owner_id == self.store.user_id)
+                    .map(|t| t.prep_retry_at)
+                    .max()
+                    .unwrap_or(0);
+                api.restore_preparation_deadline(until);
+                if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
+                    if t.state != TaskState::CoolingDown {
+                        t.state = TaskState::Preparing;
+                        t.message = "准备奖励信息".into();
+                    }
+                }
+                self.active
+                    .insert(id, engine::start_with_api(t, api, self.tx.clone()));
                 self.save();
             }
         }
@@ -633,6 +659,7 @@ impl Desk {
         cx.notify();
     }
     fn stop_session_workers(&mut self) {
+        self.session_api = None;
         for (id, cancel) in &self.active {
             cancel.store(true, Ordering::Release);
             self.stopping.insert(*id);
@@ -787,6 +814,9 @@ impl Desk {
             }
             if let Some(t) = self.store.tasks.iter_mut().find(|t| t.id == id) {
                 t.url = link;
+                if t.task_id != tid {
+                    t.prepared = None;
+                }
                 t.task_id = tid;
                 t.target = target;
                 t.state =
@@ -796,6 +826,7 @@ impl Desk {
                         TaskState::WaitingLogin
                     };
                 t.attempts = [0; 2];
+                t.prep_failures = 0;
                 t.message = "等待准备".into();
             }
         } else if let Err(e) = self.store.add(&link, target) {
@@ -876,6 +907,7 @@ impl Desk {
             ),
             TaskState::Pending | TaskState::Preparing => ("准备中", MUTED),
             TaskState::Waiting => ("已安排", BLUE),
+            TaskState::CoolingDown => ("等待恢复", MUTED),
             TaskState::Running => ("领取中", BLUE),
             TaskState::Paused => ("已暂停", MUTED),
             TaskState::Failed => ("待处理", 0xb76a39),
@@ -952,13 +984,17 @@ impl Desk {
                                 }
                             )),
                     )
-                    .when(failed, |el| {
+                    .when(failed || t.state == TaskState::CoolingDown, |el| {
                         el.child(
                             div()
                                 .text_size(px(12.))
                                 .line_height(px(19.))
-                                .text_color(rgb(0xb76a39))
-                                .child(user_message(&t.message)),
+                                .text_color(rgb(if failed { 0xb76a39 } else { MUTED }))
+                                .child(if failed {
+                                    user_message(&t.message)
+                                } else {
+                                    "暂时受限，稍后自动继续。领取时间已保留。".into()
+                                }),
                         )
                     }),
             )
@@ -970,19 +1006,22 @@ impl Desk {
                     )
                     .on_click(cx.listener(move |v, _, w, cx| v.edit(id, w, cx))),
                 )
-                .when(!failed && (running || paused), |el| {
-                    el.child(
-                        small_card_button(
-                            ("toggle", id as usize),
-                            if paused {
-                                "继续领取"
-                            } else {
-                                "暂停领取"
-                            },
+                .when(
+                    !failed && (running || paused || t.state == TaskState::CoolingDown),
+                    |el| {
+                        el.child(
+                            small_card_button(
+                                ("toggle", id as usize),
+                                if paused {
+                                    "继续领取"
+                                } else {
+                                    "暂停领取"
+                                },
+                            )
+                            .on_click(cx.listener(move |v, _, _, cx| v.toggle(id, cx))),
                         )
-                        .on_click(cx.listener(move |v, _, _, cx| v.toggle(id, cx))),
-                    )
-                })
+                    },
+                )
                 .when(failed, |el| {
                     let link = t.url.clone();
                     el.child(
@@ -1267,7 +1306,10 @@ impl Render for Desk {
             .filter(|t| {
                 matches!(
                     t.state,
-                    TaskState::Pending | TaskState::Waiting | TaskState::Preparing
+                    TaskState::Pending
+                        | TaskState::Waiting
+                        | TaskState::Preparing
+                        | TaskState::CoolingDown
                 ) && self.store.can_run(t)
                     && t.target > now
             })

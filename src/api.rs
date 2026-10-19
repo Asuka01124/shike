@@ -6,7 +6,7 @@ use reqwest::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicI64},
     time::{Duration, Instant},
 };
 
@@ -22,8 +22,59 @@ pub struct Api {
     csrf: String,
     base: String,
     key: Arc<Mutex<Option<(String, Instant)>>>,
+    account_cache: Arc<Mutex<Option<(String, u64, Instant)>>>,
+    read_next: Arc<Mutex<Instant>>,
+    pub(crate) preparation: Arc<Preparation>,
 }
-#[derive(Clone, Debug)]
+pub(crate) struct Preparation {
+    pub gate: Mutex<()>,
+    pub retry_at: AtomicI64,
+}
+/// Only explicit read-request throttling is recoverable by the preparation scheduler.
+#[derive(Debug)]
+pub struct PreparationLimit {
+    pub retry_after: i64,
+    pub message: String,
+}
+impl std::fmt::Display for PreparationLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for PreparationLimit {}
+
+fn retry_after(value: Option<&str>, now: i64) -> i64 {
+    value
+        .and_then(|v| {
+            v.trim().parse::<i64>().ok().or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(v)
+                    .ok()
+                    .map(|t| t.timestamp().saturating_sub(now))
+            })
+        })
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn check_read(v: &Value, delay: i64) -> Result<()> {
+    let code = v["code"].as_i64().unwrap_or(-99999);
+    if code == 0 {
+        return Ok(());
+    }
+    let message = format!(
+        "{}（{code}）",
+        v["message"].as_str().unwrap_or("读取信息失败")
+    );
+    if [-702, -509].contains(&code) {
+        return Err(PreparationLimit {
+            retry_after: delay,
+            message,
+        }
+        .into());
+    }
+    bail!("{message}")
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Award {
     pub task_id: String,
     pub act_id: String,
@@ -112,6 +163,11 @@ pub fn interpret_claim(v: &Value) -> ClaimReply {
     ClaimReply::Retry(code, msg)
 }
 impl Api {
+    pub fn restore_preparation_deadline(&self, until: i64) {
+        self.preparation
+            .retry_at
+            .fetch_max(until, std::sync::atomic::Ordering::AcqRel);
+    }
     pub fn new(cookie: &str) -> Result<Self> {
         Self::with_base(cookie, "https://api.bilibili.com")
     }
@@ -128,16 +184,45 @@ impl Api {
             csrf,
             base: base.into(),
             key: Arc::new(Mutex::new(None)),
+            account_cache: Arc::new(Mutex::new(None)),
+            read_next: Arc::new(Mutex::new(Instant::now())),
+            preparation: Arc::new(Preparation {
+                gate: Mutex::new(()),
+                retry_at: AtomicI64::new(0),
+            }),
         })
     }
     fn get(&self, path: &str) -> Result<Value> {
+        let mut next = self.read_next.lock().unwrap();
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        *next = Instant::now() + Duration::from_secs(1);
         let r=self.client.get(format!("{}{path}",self.base)).header(COOKIE,&self.cookie).header(REFERER,"https://www.bilibili.com/").header(USER_AGENT,"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/144.0.0.0 Safari/537.36").send()?;
+        let delay = retry_after(
+            r.headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|h| h.to_str().ok()),
+            chrono::Utc::now().timestamp(),
+        );
+        if r.status().as_u16() == 429 {
+            return Err(PreparationLimit {
+                retry_after: delay,
+                message: "读取信息暂时受限 HTTP 429".into(),
+            }
+            .into());
+        }
         if !r.status().is_success() {
             bail!("接口 HTTP {}", r.status().as_u16());
         }
-        Ok(r.json()?)
+        let value = r.json()?;
+        check_read(&value, delay)?;
+        Ok(value)
     }
     pub fn account(&self) -> Result<(String, u64)> {
+        if let Some((name, id, at)) = &*self.account_cache.lock().unwrap() {
+            if at.elapsed() < Duration::from_secs(300) {
+                return Ok((name.clone(), *id));
+            }
+        }
         let v = self.get("/x/web-interface/nav")?;
         self.cache_keys(&v);
         if !v["data"]["isLogin"].as_bool().unwrap_or(false) {
@@ -146,10 +231,12 @@ impl Api {
         if self.csrf.is_empty() {
             bail!("登录信息不完整，请重新登录");
         }
-        Ok((
+        let account: (String, u64) = (
             v["data"]["uname"].as_str().unwrap_or("B站用户").into(),
             v["data"]["mid"].as_u64().unwrap_or(0),
-        ))
+        );
+        *self.account_cache.lock().unwrap() = Some((account.0.clone(), account.1, Instant::now()));
+        Ok(account)
     }
     fn cache_keys(&self, v: &Value) {
         let img = v["data"]["wbi_img"]["img_url"].as_str().unwrap_or("");
@@ -174,6 +261,16 @@ impl Api {
         }
     }
     pub fn refresh_keys(&self) -> Result<()> {
+        // Nearby schedules share fresh keys; do not issue one NAV per task before midnight.
+        if self
+            .key
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(1800))
+        {
+            return Ok(());
+        }
         let v = self.get("/x/web-interface/nav")?;
         self.cache_keys(&v);
         self.wbi_key().map(|_| ())
@@ -270,6 +367,10 @@ mod tests {
     #[test]
     fn risk_and_already_received() {
         assert!(matches!(
+            interpret_claim(&json!({"code":-702,"message":"请求频繁"})),
+            ClaimReply::Stop(-702, _)
+        ));
+        assert!(matches!(
             interpret_claim(&json!({"code":202100})),
             ClaimReply::Stop(202100, _)
         ));
@@ -285,6 +386,34 @@ mod tests {
             interpret_claim(&json!({"code":400,"message":"今日奖品已领取完毕"})),
             ClaimReply::Retry(400, _)
         ));
+    }
+    #[test]
+    fn only_explicit_read_throttles_are_recoverable_and_retry_after_is_parsed() {
+        for code in [-702, -509] {
+            let error = check_read(&json!({"code":code,"message":"请求频繁"}), 90).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<PreparationLimit>()
+                    .unwrap()
+                    .retry_after,
+                90
+            );
+        }
+        for code in [-101, 202100, -412, 400] {
+            assert!(
+                check_read(&json!({"code":code}), 0)
+                    .unwrap_err()
+                    .downcast_ref::<PreparationLimit>()
+                    .is_none()
+            );
+        }
+        assert_eq!(retry_after(Some("90"), 0), 90);
+        assert_eq!(
+            retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 1445412420),
+            60
+        );
+        assert_eq!(retry_after(Some("-2"), 0), 0);
+        assert_eq!(retry_after(Some("invalid"), 0), 0);
     }
     #[test]
     fn csrf_and_signatures() {

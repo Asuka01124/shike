@@ -158,7 +158,7 @@ fn unknown_legacy_owner_is_bound_once_without_reassigning_old_records() {
     s.sign_out();
     assert_eq!(s.tasks[1].owner_id, 0);
     let roundtrip: Store = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
-    assert_eq!(roundtrip.schema_version, 2);
+    assert_eq!(roundtrip.schema_version, 3);
     assert_eq!(roundtrip.tasks[1].owner_id, 0);
 }
 
@@ -278,4 +278,48 @@ fn successful_inflight_response_after_logout_is_still_recorded_for_original_acco
     assert_eq!(store.tasks[0].state, TaskState::Archived);
     assert_eq!(store.tasks[0].owner_id, 1);
     assert_eq!(store.tasks[0].owner_name, "账号甲");
+}
+
+#[test]
+fn legacy_preparation_throttle_recovers_but_claim_stop_and_manual_pause_do_not() {
+    let dir = std::env::temp_dir().join(format!("shike-prep-migration-{}", std::process::id()));
+    let target = chrono::Utc::now().timestamp() + 3600;
+    let mut s = signed_in(1, "账号甲");
+    s.schema_version = 2;
+    for name in ["prepare", "claim", "paused"] {
+        add(&mut s, name, target);
+    }
+    s.tasks[0].state = TaskState::Failed;
+    s.tasks[0].message = "请求频率过高，请稍后再试（-702）".into();
+    s.tasks[1].state = TaskState::Failed;
+    s.tasks[1].message = "服务端限流，已停止 · -702".into();
+    s.tasks[1].attempts = [1, 0];
+    s.tasks[2].state = TaskState::Paused;
+    s.save(&dir).unwrap();
+    let restored = Store::load(&dir).unwrap();
+    assert_eq!(restored.schema_version, 3);
+    assert_eq!(restored.tasks[0].state, TaskState::CoolingDown);
+    assert_eq!(restored.tasks[0].target, target);
+    assert!(restored.tasks[0].prep_retry_at > chrono::Utc::now().timestamp());
+    assert_eq!(restored.tasks[1].state, TaskState::Failed);
+    assert_eq!(restored.tasks[2].state, TaskState::Paused);
+    std::fs::remove_file(dir.join("tasks.json")).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[test]
+fn late_preparation_limit_persists_account_deadline_without_resuming_paused_or_other_account() {
+    let mut s = signed_in(1, "账号甲");
+    add(&mut s, "one", 800);
+    add(&mut s, "two", 800);
+    s.tasks[1].state = TaskState::Paused;
+    s.sign_out();
+    s.sign_in("session-b".into(), "账号乙".into(), 2, 300);
+    add(&mut s, "three", 800);
+    assert!(s.apply_event(&Event::CoolingDown(1, 500, 1), true));
+    assert_eq!(s.tasks[0].state, TaskState::WaitingLogin);
+    assert_eq!(s.tasks[1].state, TaskState::Paused);
+    assert_eq!(s.tasks[0].prep_retry_at, 500);
+    assert_eq!(s.tasks[1].prep_retry_at, 500);
+    assert_eq!(s.tasks[2].prep_retry_at, 0);
 }

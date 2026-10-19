@@ -2,8 +2,8 @@
   "completedOn": "2026-10-19",
   "rust": "1.94.1",
   "gpui": "0.2.2",
-  "releaseExeBytes": 15650304,
-  "unitTests": 11,
+  "releaseExeBytes": 15702016,
+  "unitTests": 13,
   "schedulingIntegrationTests": 1,
   "uiChecks": [
     "新建弹层",
@@ -34,7 +34,9 @@
     "真实旧账号任务归属迁移",
     "弹层时间选项及取消保存按钮统一浅灰卡片",
     "选中时间使用灰色边框",
-    "时间及保存按钮悬停上浮2像素且底色不变"
+    "时间及保存按钮悬停上浮2像素且底色不变",
+    "准备限流显示灰色等待恢复及保留原领取时间",
+    "等待恢复提供灰色暂停入口"
   ],
   "liveAnonymousApi": {
     "task": "6ERAcwloghvoka00",
@@ -43,7 +45,7 @@
     "status": 8
   },
   "realClaimRequests": 0,
-  "sha256": "6FA2AD5FDCCF08F527DDC917C9A55D241E07AEF5C7152E73D2E9FB366B4643C2",
+  "sha256": "4BC679AFA2697119C40A831DB2DABE1B795CB6854D89C8EB8DFAF1D82AA51896",
   "hoverCheck": {
     "durationMs": 140,
     "offsetPixels": -2,
@@ -93,9 +95,9 @@
     "hoverLiftPixels": 2,
     "verification": "output/slider-check/verification.json"
   },
-  "accountIntegrationTests": 9,
+  "accountIntegrationTests": 11,
   "accountBehavior": {
-    "schemaVersion": 2,
+    "schemaVersion": 3,
     "logoutPreservesTasks": true,
     "sameAccountResumesFutureOnly": true,
     "manualPausePreserved": true,
@@ -113,5 +115,29 @@
     "selectedBorder": "#B8BBC4",
     "preview": "output/modal-gray-check/edit.png",
     "verification": "output/modal-gray-check/verification.json"
+  },
+  "preparationIntegrationTests": 6,
+  "preparationRecovery": {
+    "backoffSeconds": [
+      30,
+      60,
+      120
+    ],
+    "maximumFailuresPerPhase": 6,
+    "latestPreparationSecondsAfterTarget": 60,
+    "readSpacingSeconds": 1,
+    "accountCacheSeconds": 300,
+    "persistedAwardCacheSeconds": 300,
+    "serverRetryAfterRespected": true,
+    "cooldownSurvivesRestart": true,
+    "sameAccountSerialized": true,
+    "claimRateLimitStillStops": true,
+    "cacheExpiresAndDoesNotCrossLinks": true,
+    "legacyPreparationFailureMigrates": true,
+    "liveLoginAndAllThreeSchedulesPreserved": true,
+    "liveTasksRecoveredFromCooling": true,
+    "realClaimRequests": 0,
+    "preview": "output/cooling-check/waiting.png",
+    "verification": "output/cooling-check/installed-verification.json"
   }
 }

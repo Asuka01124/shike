@@ -11,12 +11,18 @@ pub enum TaskState {
     #[default]
     Pending,
     Preparing,
+    CoolingDown,
     Waiting,
     Running,
     WaitingLogin,
     Paused,
     Failed,
     Archived,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreparedAward {
+    pub award: crate::api::Award,
+    pub fetched_at: i64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
@@ -32,6 +38,12 @@ pub struct Task {
     pub owner_name: String,
     #[serde(default)]
     pub attempts: [u32; 2],
+    #[serde(default)]
+    pub prep_retry_at: i64,
+    #[serde(default)]
+    pub prep_failures: u32,
+    #[serde(default)]
+    pub prepared: Option<PreparedAward>,
     #[serde(default)]
     pub message: String,
     #[serde(default)]
@@ -69,6 +81,25 @@ impl Store {
             store.bind_legacy_tasks();
             store.schema_version = 2;
         }
+        if store.schema_version < 3 {
+            let now = Utc::now().timestamp();
+            for task in &mut store.tasks {
+                // Old preparation failures used full-width parentheses; claim stops used " · code".
+                if task.state == TaskState::Failed
+                    && task.attempts == [0; 2]
+                    && task.target > now
+                    && ["（-702）", "（-509）", "接口 HTTP 429"]
+                        .iter()
+                        .any(|s| task.message.ends_with(s))
+                {
+                    task.state = TaskState::CoolingDown;
+                    task.prep_retry_at = now + 30;
+                    task.prep_failures = 1;
+                    task.message = "暂时受限，稍后自动继续".into();
+                }
+            }
+            store.schema_version = 3;
+        }
         let current = if store.is_logged_in() {
             store.user_id
         } else {
@@ -84,7 +115,8 @@ impl Store {
                 } else {
                     TaskState::WaitingLogin
                 };
-            } else if task.state == TaskState::Pending && (current == 0 || task.owner_id != current)
+            } else if matches!(task.state, TaskState::Pending | TaskState::CoolingDown)
+                && (current == 0 || task.owner_id != current)
             {
                 task.state = TaskState::WaitingLogin;
             }
@@ -144,6 +176,9 @@ impl Store {
             owner_id: self.user_id,
             owner_name: self.user_name.clone(),
             attempts: [0; 2],
+            prep_retry_at: 0,
+            prep_failures: 0,
+            prepared: None,
             message: "等待准备".into(),
             cdkey: None,
             archived_at: None,
@@ -194,7 +229,11 @@ impl Store {
         for task in &mut self.tasks {
             if matches!(
                 task.state,
-                TaskState::Pending | TaskState::Preparing | TaskState::Waiting | TaskState::Running
+                TaskState::Pending
+                    | TaskState::Preparing
+                    | TaskState::CoolingDown
+                    | TaskState::Waiting
+                    | TaskState::Running
             ) {
                 task.state = TaskState::WaitingLogin;
                 task.message = "等待登录该账号".into();
@@ -203,7 +242,7 @@ impl Store {
     }
     pub fn sign_in(&mut self, cookie: String, name: String, user_id: u64, now: i64) {
         self.sign_out();
-        self.schema_version = 2;
+        self.schema_version = 3;
         self.cookie = cookie;
         self.user_name = name;
         self.user_id = user_id;
@@ -219,6 +258,26 @@ impl Store {
     pub fn apply_event(&mut self, event: &crate::engine::Event, stopping: bool) -> bool {
         use crate::engine::Event;
         let id = event.task_id();
+        if let Event::CoolingDown(_, until, count) = event {
+            // Keep the account's server deadline even if logout/cancel raced with the response.
+            if let Some(owner) = self.tasks.iter().find(|t| t.id == id).map(|t| t.owner_id) {
+                for task in self.tasks.iter_mut().filter(|t| t.owner_id == owner) {
+                    task.prep_retry_at = task.prep_retry_at.max(*until);
+                    if task.id == id {
+                        task.prep_failures = *count;
+                    }
+                }
+            }
+            if stopping
+                || !self
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .is_some_and(|t| self.can_run(t))
+            {
+                return true;
+            }
+        }
         if let Event::Archive(_, message, key) = event {
             self.archive(id, message.clone(), key.clone());
             return true;
@@ -244,10 +303,16 @@ impl Store {
             return false;
         }
         match event {
+            Event::Metadata(_, award) => task.prepared = Some(award.clone()),
+            Event::CoolingDown(..) => {
+                task.state = TaskState::CoolingDown;
+                task.message = "暂时受限，稍后自动继续".into();
+            }
             Event::Prepared(_, title) => task.title = title.clone(),
             Event::Waiting(_) => {
                 task.state = TaskState::Waiting;
                 task.message = "等待执行".into();
+                task.prep_failures = 0;
             }
             Event::Started(_) => {
                 task.state = TaskState::Running;

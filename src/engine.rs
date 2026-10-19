@@ -1,6 +1,6 @@
 use crate::{
-    api::{Api, ClaimReply},
-    store::Task,
+    api::{Api, ClaimReply, PreparationLimit},
+    store::{PreparedAward, Task},
 };
 use anyhow::Result;
 use std::{
@@ -16,6 +16,8 @@ use std::{
 #[derive(Clone, Debug)]
 pub enum Event {
     Prepared(u64, String),
+    Metadata(u64, PreparedAward),
+    CoolingDown(u64, i64, u32),
     Waiting(u64),
     Started(u64),
     Attempt(u64, usize, u32),
@@ -29,6 +31,8 @@ impl Event {
     pub fn task_id(&self) -> u64 {
         match self {
             Self::Prepared(id, _)
+            | Self::Metadata(id, _)
+            | Self::CoolingDown(id, ..)
             | Self::Waiting(id)
             | Self::Started(id)
             | Self::Attempt(id, ..)
@@ -148,20 +152,43 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
     thread::spawn(move || {
         let id = task.id;
         let result = (|| -> Result<()> {
+            let mut failures = task.prep_failures;
+            api.preparation
+                .retry_at
+                .fetch_max(task.prep_retry_at, Ordering::AcqRel);
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let (_, account_id) = api.account()?;
-            if task.owner_id == 0 || task.owner_id != account_id {
-                anyhow::bail!("请登录这份奖励所属的账号后再领取");
-            }
+            let Some(prepared) = prepare(&task, &api, &stop, &tx, &mut failures, || {
+                let (_, account_id) = api.account()?;
+                if task.owner_id == 0 || task.owner_id != account_id {
+                    anyhow::bail!("请登录这份奖励所属的账号后再领取");
+                }
+                if stop.load(Ordering::Acquire) {
+                    anyhow::bail!("已取消准备");
+                }
+                let now = chrono::Utc::now().timestamp();
+                if let Some(cached) = &task.prepared {
+                    if cached.award.task_id == task.task_id
+                        && (0..300).contains(&now.saturating_sub(cached.fetched_at))
+                    {
+                        return Ok(cached.clone());
+                    }
+                }
+                Ok(PreparedAward {
+                    award: api.award_info(&task.task_id)?,
+                    fetched_at: chrono::Utc::now().timestamp(),
+                })
+            })?
+            else {
+                let _ = tx.send(Event::Paused(id));
+                return Ok(());
+            };
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let award = api.award_info(&task.task_id)?;
-            if stop.load(Ordering::Acquire) {
-                return Ok(());
-            }
+            let award = prepared.award.clone();
+            let _ = tx.send(Event::Metadata(id, prepared));
             let title = format!("{} · {}", award.task_name, award.reward_name);
             let _ = tx.send(Event::Prepared(id, title));
             if award.status == 6 {
@@ -173,6 +200,7 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
                 anyhow::bail!("已错过执行时间，请重新设置");
             }
             let _ = tx.send(Event::Waiting(id));
+            failures = 0;
             let mut refreshed = false;
             while chrono::Utc::now().timestamp_millis() < task.target * 1000 {
                 if stop.load(Ordering::Acquire) {
@@ -181,7 +209,15 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
                 }
                 let left = task.target * 1000 - chrono::Utc::now().timestamp_millis();
                 if left <= 15000 && !refreshed {
-                    api.refresh_keys()?;
+                    if prepare(&task, &api, &stop, &tx, &mut failures, || {
+                        api.refresh_keys()
+                    })?
+                    .is_none()
+                    {
+                        let _ = tx.send(Event::Paused(id));
+                        return Ok(());
+                    }
+                    let _ = tx.send(Event::Waiting(id));
                     refreshed = true;
                     continue;
                 }
@@ -190,6 +226,9 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
             if stop.load(Ordering::Acquire) {
                 let _ = tx.send(Event::Paused(id));
                 return Ok(());
+            }
+            if chrono::Utc::now().timestamp() > task.target.saturating_add(60) {
+                anyhow::bail!("准备未能及时完成，请重新安排领取时间");
             }
             let _ = tx.send(Event::Started(id));
             let claim = Arc::new(move |_: usize, _: u32| api.claim(&award));
@@ -215,10 +254,120 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
     cancel
 }
 
+const MAX_PREPARATION_FAILURES: u32 = 6;
+fn preparation_delay(failures: u32, server_delay: i64) -> i64 {
+    (30_i64 << failures.saturating_sub(1).min(2)).max(server_delay)
+}
+
+/// Serializes preparation across all tasks sharing this login, never holding the gate while cooling.
+fn prepare<T>(
+    task: &Task,
+    api: &Api,
+    cancel: &AtomicBool,
+    tx: &Sender<Event>,
+    failures: &mut u32,
+    action: impl Fn() -> Result<T>,
+) -> Result<Option<T>> {
+    let mut notified = None;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now().timestamp();
+        if now > task.target.saturating_add(60) {
+            anyhow::bail!("准备未能及时完成，请重新安排领取时间");
+        }
+        if *failures >= MAX_PREPARATION_FAILURES {
+            anyhow::bail!("暂时无法读取奖励信息，请稍后重新安排");
+        }
+        let retry_at = api.preparation.retry_at.load(Ordering::Acquire);
+        if retry_at > now {
+            if notified != Some(retry_at) {
+                let _ = tx.send(Event::CoolingDown(task.id, retry_at, *failures));
+                notified = Some(retry_at);
+            }
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        let Ok(_gate) = api.preparation.gate.try_lock() else {
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        };
+        // Another task may have entered cooling just before we acquired the gate.
+        if api.preparation.retry_at.load(Ordering::Acquire) > chrono::Utc::now().timestamp() {
+            continue;
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match action() {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) => {
+                let Some(limit) = error.downcast_ref::<PreparationLimit>() else {
+                    return Err(error);
+                };
+                *failures += 1;
+                let until = chrono::Utc::now()
+                    .timestamp()
+                    .saturating_add(preparation_delay(*failures, limit.retry_after));
+                api.preparation.retry_at.fetch_max(until, Ordering::AcqRel);
+                let _ = tx.send(Event::CoolingDown(task.id, until, *failures));
+                notified = Some(until);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{atomic::AtomicUsize, mpsc};
+    #[test]
+    fn preparation_backoff_respects_server_and_has_a_finite_budget() {
+        assert_eq!(preparation_delay(1, 0), 30);
+        assert_eq!(preparation_delay(2, 0), 60);
+        assert_eq!(preparation_delay(3, 0), 120);
+        assert_eq!(preparation_delay(5, 300), 300);
+        let mut store = crate::store::Store::default();
+        store.sign_in("test".into(), "测试".into(), 1, 0);
+        store
+            .add(
+                "https://www.bilibili.com/?task_id=limited",
+                chrono::Utc::now().timestamp() + 60,
+            )
+            .unwrap();
+        let task = &store.tasks[0];
+        let api = Api::with_base("test", "http://127.0.0.1:1").unwrap();
+        let (tx, _) = mpsc::channel();
+        let mut count = MAX_PREPARATION_FAILURES;
+        assert!(
+            prepare(
+                task,
+                &api,
+                &AtomicBool::new(false),
+                &tx,
+                &mut count,
+                || -> Result<()> { panic!("耗尽预算不得再请求") }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("稍后重新安排")
+        );
+        count = 0;
+        let mut missed = task.clone();
+        missed.target = chrono::Utc::now().timestamp() - 61;
+        assert!(
+            prepare(
+                &missed,
+                &api,
+                &AtomicBool::new(false),
+                &tx,
+                &mut count,
+                || -> Result<()> { panic!("过期不得再请求") }
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn two_real_threads_and_message_success() {
         let gate = Arc::new(Barrier::new(2));
