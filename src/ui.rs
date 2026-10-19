@@ -1392,13 +1392,7 @@ impl Render for Desk {
                                 div()
                                     .size(px(28.))
                                     .bg(rgb(0xf0f4ff))
-                                    .rounded(px(8.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(rgb(BLUE))
-                                    .text_size(px(17.))
-                                    .child("时"),
+                                    .rounded(px(8.)),
                             )
                             .child(
                                 div()
