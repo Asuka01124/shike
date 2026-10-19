@@ -5,7 +5,7 @@ use crate::{
 use anyhow::Result;
 use std::{
     sync::{
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::Sender,
     },
@@ -63,6 +63,7 @@ pub fn run_workers(
     max_attempts: u32,
 ) {
     let done = Arc::new(AtomicU8::new(0));
+    let last_error = Arc::new(Mutex::new(None::<String>));
     let barrier = Arc::new(Barrier::new(3));
     let mut handles = Vec::new();
     for worker in 0..2 {
@@ -73,6 +74,7 @@ pub fn run_workers(
             done.clone(),
             barrier.clone(),
         );
+        let last_error = last_error.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
             for attempt in 1..=max_attempts {
@@ -96,28 +98,15 @@ pub fn run_workers(
                         cancel.store(true, Ordering::Release);
                         break;
                     }
-                    Ok(ClaimReply::Stop(code, message)) => {
-                        if done
-                            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                        {
-                            let _ = tx.send(Event::Failed(id, format!("{message} · {code}")));
-                        }
-                        cancel.store(true, Ordering::Release);
-                        break;
-                    }
                     Ok(ClaimReply::Retry(code, message)) => {
-                        let _ = tx.send(Event::Message(id, format!("{message} · {code}")));
+                        let message = format!("{message} · {code}");
+                        *last_error.lock().unwrap() = Some(message.clone());
+                        let _ = tx.send(Event::Message(id, message));
                     }
                     Err(error) => {
-                        if done
-                            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                        {
-                            let _ = tx.send(Event::Failed(id, format!("{error}；请核对领奖记录")));
-                        }
-                        cancel.store(true, Ordering::Release);
-                        break;
+                        let message = format!("{error}；将继续尝试");
+                        *last_error.lock().unwrap() = Some(message.clone());
+                        let _ = tx.send(Event::Message(id, message));
                     }
                 }
                 pause_until(next, &cancel);
@@ -132,7 +121,15 @@ pub fn run_workers(
         let _ = tx.send(if cancel.load(Ordering::Acquire) {
             Event::Paused(id)
         } else {
-            Event::Failed(id, "本轮结束，尚未领取".into())
+            Event::Failed(
+                id,
+                match last_error.lock().unwrap().as_ref() {
+                    Some(message) => {
+                        format!("本轮结束，尚未领取；最后结果：{message}；请核对领奖记录")
+                    }
+                    None => "本轮结束，尚未领取；请核对领奖记录".into(),
+                },
+            )
         });
     }
 }
@@ -429,6 +426,65 @@ mod tests {
                 .filter(|e| matches!(e, Event::Attempt(..)))
                 .count(),
             6
+        );
+    }
+    #[test]
+    fn request_errors_retry_until_budget_and_preserve_last_failure() {
+        let claim = Arc::new(|_: usize, _: u32| -> Result<ClaimReply> {
+            anyhow::bail!("测试连接中断")
+        });
+        let (tx, rx) = mpsc::channel();
+        run_workers(
+            1,
+            claim,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            Duration::from_millis(5),
+            3,
+        );
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Attempt(..)))
+                .count(),
+            6
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Message(..)))
+                .count(),
+            6
+        );
+        assert_eq!(events.iter().filter(|e| matches!(e, Event::Failed(_, msg) if msg.contains("本轮结束") && msg.contains("测试连接中断"))).count(), 1);
+        assert!(!events.iter().any(|e| matches!(e, Event::Archive(..))));
+    }
+    #[test]
+    fn cancellation_during_failures_stops_both_workers() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let gate = Arc::new(Barrier::new(2));
+        let claim = Arc::new(move |_: usize, _: u32| {
+            gate.wait();
+            flag.store(true, Ordering::Release);
+            Ok(ClaimReply::Retry(-702, "请求频繁".into()))
+        });
+        let (tx, rx) = mpsc::channel();
+        run_workers(1, claim, cancel, tx, Duration::from_millis(5), 120);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Attempt(..)))
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::Paused(..))));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Failed(..) | Event::Archive(..)))
         );
     }
 }

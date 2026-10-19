@@ -89,7 +89,6 @@ pub enum ClaimReply {
     Success(Option<String>),
     Already,
     Retry(i64, String),
-    Stop(i64, String),
 }
 pub fn normalize_cookie(cookie: &str) -> String {
     cookie
@@ -136,18 +135,6 @@ pub fn interpret_claim(v: &Value) -> ClaimReply {
                 .map(str::to_owned),
         );
     }
-    if [-101, 61000, 202100, 202101, 202102, -509, -702, -412].contains(&code) {
-        return ClaimReply::Stop(
-            code,
-            match code {
-                -101 | 61000 => "登录已过期，请重新登录".into(),
-                202100 => "需要网页验证".into(),
-                202101 => "账号暂时无法领取".into(),
-                -509 | -702 => "服务端限流，已停止".into(),
-                _ => msg,
-            },
-        );
-    }
     if ["领取完", "领完", "抢完", "库存"]
         .iter()
         .any(|s| msg.contains(s))
@@ -156,9 +143,6 @@ pub fn interpret_claim(v: &Value) -> ClaimReply {
     }
     if msg.contains("已领取") || msg.contains("已领奖") || msg.contains("已经领取") {
         return ClaimReply::Already;
-    }
-    if msg.contains("活动已结束") || msg.contains("活动不存在") {
-        return ClaimReply::Stop(code, msg);
     }
     ClaimReply::Retry(code, msg)
 }
@@ -329,14 +313,8 @@ impl Api {
             .form(&[("task_id",a.task_id.as_str()),("activity_id",a.act_id.as_str()),("activity_name",a.act_name.as_str()),("task_name",a.task_name.as_str()),
                 ("reward_name",a.reward_name.as_str()),("gaia_vtoken",""),("receive_from","missionPage"),("csrf",self.csrf.as_str())]).send()?;
         let status = r.status().as_u16();
-        if [403, 412, 429].contains(&status) {
-            return Ok(ClaimReply::Stop(
-                status.into(),
-                format!("请求受限 HTTP {status}"),
-            ));
-        }
         if !r.status().is_success() {
-            bail!("领取响应 HTTP {status}，请核对领奖记录");
+            bail!("领取响应 HTTP {status}");
         }
         Ok(interpret_claim(&r.json()?))
     }
@@ -365,15 +343,21 @@ mod tests {
         );
     }
     #[test]
-    fn risk_and_already_received() {
-        assert!(matches!(
-            interpret_claim(&json!({"code":-702,"message":"请求频繁"})),
-            ClaimReply::Stop(-702, _)
-        ));
-        assert!(matches!(
-            interpret_claim(&json!({"code":202100})),
-            ClaimReply::Stop(202100, _)
-        ));
+    fn all_failure_codes_retry_and_already_received_finishes() {
+        for code in [
+            -101, 61000, 202100, 202101, 202102, -509, -702, -412, 400, 99999,
+        ] {
+            assert_eq!(
+                interpret_claim(&json!({"code":code,"message":"原始失败原因"})),
+                ClaimReply::Retry(code, "原始失败原因".into())
+            );
+        }
+        for message in ["活动已结束", "活动不存在"] {
+            assert_eq!(
+                interpret_claim(&json!({"code":400,"message":message})),
+                ClaimReply::Retry(400, message.into())
+            );
+        }
         assert_eq!(
             interpret_claim(&json!({"code":202005,"message":"已领取"})),
             ClaimReply::Already

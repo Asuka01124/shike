@@ -287,32 +287,65 @@ fn login_verification_and_eligibility_errors_are_not_cooling_retries() {
 }
 
 #[test]
-fn actual_claim_throttling_still_stops_instead_of_preparation_retry() {
-    let server = Server::new(|path, _| {
-        (
-            200,
-            String::new(),
-            if path.starts_with("post ") {
-                json!({"code":-702,"message":"频繁"})
-            } else {
-                ordinary(path)
-            },
-        )
+fn claim_retries_business_and_http_failures_until_success_without_preparation_cooling() {
+    use std::sync::atomic::AtomicUsize;
+    let posts = Arc::new(AtomicUsize::new(0));
+    let counter = posts.clone();
+    let failures = [-702, -509, -101, 202100, 202101, 202102, -412];
+    let server = Server::new(move |path, _| {
+        if path.starts_with("post ") {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            if let Some(code) = failures.get(index) {
+                return (
+                    200,
+                    String::new(),
+                    json!({"code":code,"message":"暂时失败"}),
+                );
+            }
+            if let Some(status) = [403, 412, 429, 503].get(index.saturating_sub(failures.len())) {
+                return (*status, String::new(), json!({}));
+            }
+        }
+        (200, String::new(), ordinary(path))
     });
     let s = store(chrono::Utc::now().timestamp() + 2);
     let (tx, rx) = mpsc::channel();
-    let _cancel = engine::start_with_api(s.tasks[0].clone(), server.api(), tx);
-    let events: Vec<_> = rx.iter().collect();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, Event::Failed(_, msg) if msg.contains("限流")))
-    );
+    let cancel = engine::start_with_api(s.tasks[0].clone(), server.api(), tx);
+    let mut events = Vec::new();
+    loop {
+        let event = match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(event) => event,
+            Err(error) => {
+                cancel.store(true, Ordering::Release);
+                panic!("领取未完成: {error}");
+            }
+        };
+        let finished = matches!(event, Event::Finished(_));
+        events.push(event);
+        if finished {
+            break;
+        }
+    }
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e, Event::CoolingDown(..) | Event::Archive(..)))
+            .any(|e| matches!(e, Event::CoolingDown(..) | Event::Failed(..)))
     );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::Archive(..)))
+            .count(),
+        1
+    );
+    for code in failures {
+        assert!(events.iter().any(
+            |e| matches!(e, Event::Message(_, message) if message.ends_with(&format!(" · {code}")))
+        ));
+    }
+    for status in [403, 412, 429, 503] {
+        assert!(events.iter().any(|e| matches!(e, Event::Message(_, message) if message.contains(&format!("HTTP {status}")))));
+    }
     assert!(
         server
             .log
@@ -321,6 +354,6 @@ fn actual_claim_throttling_still_stops_instead_of_preparation_retry() {
             .iter()
             .filter(|(p, _)| p.starts_with("post "))
             .count()
-            <= 2
+            >= 12
     );
 }
