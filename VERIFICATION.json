@@ -2,7 +2,7 @@
   "completedOn": "2026-10-19",
   "rust": "1.94.1",
   "gpui": "0.2.2",
-  "releaseExeBytes": 15701504,
+  "releaseExeBytes": 15699968,
   "unitTests": 13,
   "schedulingIntegrationTests": 1,
   "uiChecks": [
@@ -37,7 +37,7 @@
     "时间及保存按钮悬停上浮2像素且底色不变",
     "准备限流显示灰色等待恢复及保留原领取时间",
     "等待恢复提供灰色暂停入口",
-    "左上角浅色图标删除时字"
+    "品牌区域仅显示拾刻两字，无图标或色块"
   ],
   "liveAnonymousApi": {
     "task": "6ERAcwloghvoka00",
@@ -46,7 +46,7 @@
     "status": 8
   },
   "realClaimRequests": 0,
-  "sha256": "0662A01BBADE51AADCD42276EB74C91397C749FB7A66255CE52ED97E45E56C8C",
+  "sha256": "9A39FA64DD7CC7BCD9EEF51B9E02F4CE3461609C355C08CF1C544409DC848A77",
   "hoverCheck": {
     "durationMs": 140,
     "offsetPixels": -2,

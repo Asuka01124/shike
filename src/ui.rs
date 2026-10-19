@@ -1390,12 +1390,6 @@ impl Render for Desk {
                             .gap_3()
                             .child(
                                 div()
-                                    .size(px(28.))
-                                    .bg(rgb(0xf0f4ff))
-                                    .rounded(px(8.)),
-                            )
-                            .child(
-                                div()
                                     .text_size(px(19.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("拾刻"),
