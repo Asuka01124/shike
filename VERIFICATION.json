@@ -1,0 +1,89 @@
+{
+  "completedOn": "2026-10-19",
+  "rust": "1.94.1",
+  "gpui": "0.2.2",
+  "releaseExeBytes": 15639552,
+  "unitTests": 11,
+  "schedulingIntegrationTests": 1,
+  "uiChecks": [
+    "新建弹层",
+    "长链接输入和滚动",
+    "创建任务列表更新",
+    "归档列表",
+    "关闭到托盘",
+    "单实例恢复",
+    "白色及浅蓝组件，无黑色底按钮",
+    "待领取及归档空列表仅显示无任务",
+    "悬停140毫秒平滑上浮2像素",
+    "悬停前后底色相同，移出后像素完全复位",
+    "浅色新建任务弹层",
+    "普通用户首页及添加奖励入口",
+    "明天零点默认选择及北京时间保存",
+    "自选时间保存准确",
+    "链接及时间就地错误提示",
+    "未登录的现在领取先引导登录",
+    "领取记录页",
+    "失败提示隐藏错误码并提供操作入口",
+    "首页三个操作采用浅灰底色",
+    "账号操作统一分段滑块",
+    "滑块右移及移出复位像素验证",
+    "列表修改及暂停继续操作统一浅灰小卡片"
+  ],
+  "liveAnonymousApi": {
+    "task": "6ERAcwloghvoka00",
+    "title": "新人主播开播2小时",
+    "message": "暂无领取资格",
+    "status": 8
+  },
+  "realClaimRequests": 0,
+  "sha256": "CF679753A397E55D50A265954F1A98F7E3246F552B05FD8766306646C3EA7FA6",
+  "hoverCheck": {
+    "durationMs": 140,
+    "offsetPixels": -2,
+    "surfaceRGB": [
+      240,
+      244,
+      255
+    ],
+    "normalBounds": [
+      788,
+      203,
+      898,
+      247
+    ],
+    "hoverBounds": [
+      788,
+      201,
+      898,
+      245
+    ],
+    "restoredPixelsIdentical": true
+  },
+  "productCopyReview": {
+    "removed": [
+      "线程数标签",
+      "请求间隔标签",
+      "尝试次数",
+      "本地运行",
+      "底层错误码"
+    ],
+    "timeChoices": [
+      "明天零点",
+      "现在领取",
+      "自选时间"
+    ],
+    "emptyState": "无任务",
+    "scheduledPreview": "output/product-check/scheduled.png",
+    "modalPreview": "output/product-check/add-reward.png",
+    "flowVerification": "output/product-check/flow-verification.json",
+    "claimRequestsDuringReview": 0
+  },
+  "homepageActionStyle": {
+    "surface": "#EFF0F3",
+    "thumb": "#FAFAFB",
+    "sliderTravelPixels": 96,
+    "durationMs": 140,
+    "hoverLiftPixels": 2,
+    "verification": "output/slider-check/verification.json"
+  }
+}

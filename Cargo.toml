@@ -1,0 +1,48 @@
+[package]
+name = "shike"
+version = "1.0.0"
+edition = "2024"
+description = "拾刻 · B站直播奖励定时领取"
+license = "MIT"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:gpui", "dep:unicode-segmentation", "dep:smol", "dep:tray-icon"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"], optional = true }
+md5 = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+unicode-segmentation = { version = "1", optional = true }
+smol = { version = "2", optional = true }
+tray-icon = { version = "0.21", default-features = false, optional = true }
+tungstenite = "0.26"
+raw-window-handle = "0.6"
+fs2 = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_System_Power", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[[bin]]
+name = "shike"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.release]
+opt-level = 2
+strip = true
+debug = 0
+lto = false
+codegen-units = 16
