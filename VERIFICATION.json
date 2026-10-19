@@ -2,7 +2,7 @@
   "completedOn": "2026-10-19",
   "rust": "1.94.1",
   "gpui": "0.2.2",
-  "releaseExeBytes": 15659520,
+  "releaseExeBytes": 15650304,
   "unitTests": 11,
   "schedulingIntegrationTests": 1,
   "uiChecks": [
@@ -31,7 +31,10 @@
     "任务时间旁显示所属账号",
     "退出登录保留窗口任务及记录",
     "不同账号显示等待登录该账号",
-    "真实旧账号任务归属迁移"
+    "真实旧账号任务归属迁移",
+    "弹层时间选项及取消保存按钮统一浅灰卡片",
+    "选中时间使用灰色边框",
+    "时间及保存按钮悬停上浮2像素且底色不变"
   ],
   "liveAnonymousApi": {
     "task": "6ERAcwloghvoka00",
@@ -40,7 +43,7 @@
     "status": 8
   },
   "realClaimRequests": 0,
-  "sha256": "FFA118F56975512DD880D4B65C7C64C6C35BEBE11510CF961995D88CDE68A01C",
+  "sha256": "6FA2AD5FDCCF08F527DDC917C9A55D241E07AEF5C7152E73D2E9FB366B4643C2",
   "hoverCheck": {
     "durationMs": 140,
     "offsetPixels": -2,
@@ -104,5 +107,11 @@
     "realMigrationVerified": true,
     "existingLoginAndSchedulePreserved": true,
     "inflightIdentityCannotBeEdited": true
+  },
+  "modalControlsStyle": {
+    "surface": "#EFF0F3",
+    "selectedBorder": "#B8BBC4",
+    "preview": "output/modal-gray-check/edit.png",
+    "verification": "output/modal-gray-check/verification.json"
   }
 }

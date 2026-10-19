@@ -184,23 +184,6 @@ fn text_button(id: impl Into<ElementId>, text: &str) -> LiftButton {
             .child(text.to_string()),
     )
 }
-fn primary_button(id: impl Into<ElementId>, text: &str) -> LiftButton {
-    LiftButton::new(
-        id,
-        div()
-            .px(px(19.))
-            .py(px(12.))
-            .rounded(px(9.))
-            .border_1()
-            .border_color(rgb(0xdce5ff))
-            .bg(rgb(0xf0f4ff))
-            .text_color(rgb(BLUE))
-            .text_size(px(13.))
-            .font_weight(FontWeight::MEDIUM)
-            .child(text.to_string()),
-    )
-}
-
 fn card_button(id: impl Into<ElementId>, text: &str) -> LiftButton {
     LiftButton::new(
         id,
@@ -337,9 +320,9 @@ fn time_button(id: &'static str, text: &str, selected: bool) -> LiftButton {
             .py(px(10.))
             .rounded(px(8.))
             .border_1()
-            .border_color(rgb(if selected { 0xdce5ff } else { BORDER }))
-            .bg(rgb(if selected { 0xf0f4ff } else { 0xffffff }))
-            .text_color(rgb(if selected { BLUE } else { MUTED }))
+            .border_color(rgb(if selected { 0xb8bbc4 } else { 0xe7e8ec }))
+            .bg(rgb(0xeff0f3))
+            .text_color(rgb(if selected { 0x41434c } else { 0x555660 }))
             .text_size(px(13.))
             .child(text.to_string()),
     )
@@ -1225,14 +1208,14 @@ impl Desk {
                             .items_center()
                             .gap_3()
                             .pt_1()
-                            .child(text_button("cancel", "取消").on_click(cx.listener(
+                            .child(card_button("cancel", "取消").on_click(cx.listener(
                                 |v, _, _, cx| {
                                     v.dialog = false;
                                     cx.notify();
                                 },
                             )))
                             .child(
-                                primary_button(
+                                card_button(
                                     "commit",
                                     if login_required && self.login_cancel.is_some() {
                                         "请在浏览器登录"
