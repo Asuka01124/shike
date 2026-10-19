@@ -40,22 +40,7 @@ fn make_tray() -> Option<Tray> {
     let quit = MenuItem::new("退出软件", true, None);
     menu.append_items(&[&open, &PredefinedMenuItem::separator(), &quit])
         .ok()?;
-    let mut pixels = vec![0u8; 32 * 32 * 4];
-    for y in 0..32usize {
-        for x in 0..32usize {
-            let i = (y * 32 + x) * 4;
-            let hand = (15..=17).contains(&x) && (9..=17).contains(&y)
-                || (15..=17).contains(&y) && (15..=23).contains(&x);
-            let color = if hand {
-                [61, 106, 242, 255]
-            } else if (3..29).contains(&x) && (3..29).contains(&y) {
-                [235, 241, 255, 255]
-            } else {
-                [0, 0, 0, 0]
-            };
-            pixels[i..i + 4].copy_from_slice(&color);
-        }
-    }
+    let pixels = include_bytes!("../assets/shike-tray.rgba").to_vec();
     let tray = TrayIconBuilder::new()
         .with_tooltip("拾刻 · 定时领取")
         .with_icon(Icon::from_rgba(pixels, 32, 32).ok()?)
