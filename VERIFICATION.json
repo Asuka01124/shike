@@ -2,7 +2,7 @@
   "completedOn": "2026-10-19",
   "rust": "1.94.1",
   "gpui": "0.2.2",
-  "releaseExeBytes": 15753728,
+  "releaseExeBytes": 15746048,
   "unitTests": 13,
   "schedulingIntegrationTests": 1,
   "uiChecks": [
@@ -46,7 +46,7 @@
     "status": 8
   },
   "realClaimRequests": 0,
-  "sha256": "349BE987A9907EE4D958D758239A8644B12D024C6F645637D1E6E5F9B388470C",
+  "sha256": "DE4B90CD9FA3700642D5E2FA33AEF1EF477E59435A17503FAEF092221357A63F",
   "hoverCheck": {
     "durationMs": 140,
     "offsetPixels": -2,
@@ -142,7 +142,7 @@
     "verification": "output/cooling-check/installed-verification.json"
   },
   "applicationIcon": {
-    "source": "assets/shike-source.png",
+    "source": "assets/shike-transparent.png",
     "windowsIco": "assets/shike.ico",
     "sizes": [
       16,
@@ -158,6 +158,9 @@
     "tray": "assets/shike-tray.rgba",
     "embeddedResourceVerified": true,
     "desktopAndStartMenuUpdated": true,
-    "preview": "output/icon-check/installed.png"
+    "preview": "output/icon-check/transparent-installed.png",
+    "originalSource": "assets/shike-source.png",
+    "transparentExterior": true,
+    "insideWhitePreserved": true
   }
 }
