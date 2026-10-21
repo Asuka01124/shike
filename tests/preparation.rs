@@ -102,6 +102,36 @@ fn store(target: i64) -> Store {
 }
 
 #[test]
+fn refreshes_old_waiting_metadata_before_claim_time_without_submitting_early() {
+    let server = Server::new(|path, _| (200, String::new(), ordinary(path)));
+    let now = chrono::Utc::now().timestamp();
+    let mut saved = store(now + 18);
+    saved.tasks[0].prepared = Some(shike::store::PreparedAward {
+        fetched_at: now - 298,
+        award: shike::api::Award {
+            task_id: "one".into(), act_id: "old-act".into(), act_name: "旧活动".into(),
+            task_name: "旧任务".into(), reward_name: "旧奖励".into(), status: 0, message: String::new(),
+        },
+    });
+    let (tx, rx) = mpsc::channel();
+    let cancel = engine::start_with_api(saved.tasks[0].clone(), server.api(), tx);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut metadata = Vec::new();
+    while metadata.len() < 2 && Instant::now() < deadline {
+        if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+            if let Event::Metadata(_, prepared) = event { metadata.push(prepared); }
+        }
+    }
+    cancel.store(true, Ordering::Release);
+    while !matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event::Finished(_)) {}
+    assert_eq!(metadata.len(), 2, "临近执行时应刷新等待期间过期的信息");
+    assert_eq!(metadata[0].award.reward_name, "旧奖励");
+    assert_eq!(metadata[1].award.reward_name, "奖励");
+    assert!(metadata[1].fetched_at > metadata[0].fetched_at);
+    assert!(!server.log.lock().unwrap().iter().any(|(path, _)| path.starts_with("post ")));
+}
+
+#[test]
 fn read_429_carries_the_server_retry_after() {
     let server = Server::new(|_, _| (429, "Retry-After: 95\r\n".into(), json!({})));
     let error = server.api().account().unwrap_err();

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use reqwest::{
     blocking::Client,
-    header::{COOKIE, ORIGIN, REFERER, USER_AGENT},
+    cookie::{CookieStore, Jar},
+    header::{REFERER, USER_AGENT},
 };
 use serde_json::{Value, json};
 use std::{
@@ -18,8 +19,8 @@ const MIX: [usize; 64] = [
 #[derive(Clone)]
 pub struct Api {
     client: Client,
-    cookie: String,
-    csrf: String,
+    cookies: Arc<Jar>,
+    cookie_url: url::Url,
     base: String,
     key: Arc<Mutex<Option<(String, Instant)>>>,
     account_cache: Arc<Mutex<Option<(String, u64, Instant)>>>,
@@ -157,15 +158,20 @@ impl Api {
     }
     pub fn with_base(cookie: &str, base: &str) -> Result<Self> {
         let cookie = normalize_cookie(cookie);
-        let csrf = cookie_value(&cookie, "bili_jct").unwrap_or_default();
+        let cookie_url = url::Url::parse(&format!("{}/", base.trim_end_matches('/')))?;
+        let cookies = Arc::new(Jar::default());
+        for part in cookie.split(';').map(str::trim).filter(|p| p.contains('=')) {
+            cookies.add_cookie_str(&format!("{part}; Path=/"), &cookie_url);
+        }
         Ok(Self {
             client: Client::builder()
+                .cookie_provider(cookies.clone())
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(8))
                 .pool_idle_timeout(Duration::from_secs(90))
                 .build()?,
-            cookie,
-            csrf,
+            cookies,
+            cookie_url,
             base: base.into(),
             key: Arc::new(Mutex::new(None)),
             account_cache: Arc::new(Mutex::new(None)),
@@ -180,7 +186,7 @@ impl Api {
         let mut next = self.read_next.lock().unwrap();
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
         *next = Instant::now() + Duration::from_secs(1);
-        let r=self.client.get(format!("{}{path}",self.base)).header(COOKIE,&self.cookie).header(REFERER,"https://www.bilibili.com/").header(USER_AGENT,"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/144.0.0.0 Safari/537.36").send()?;
+        let r=self.client.get(format!("{}{path}",self.base)).header(REFERER,"https://www.bilibili.com/").header(USER_AGENT,"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/144.0.0.0 Safari/537.36").send()?;
         let delay = retry_after(
             r.headers()
                 .get(reqwest::header::RETRY_AFTER)
@@ -212,7 +218,7 @@ impl Api {
         if !v["data"]["isLogin"].as_bool().unwrap_or(false) {
             bail!("请先登录B站账号");
         }
-        if self.csrf.is_empty() {
+        if self.csrf().is_empty() {
             bail!("登录信息不完整，请重新登录");
         }
         let account: (String, u64) = (
@@ -306,17 +312,38 @@ impl Api {
     }
     pub fn claim(&self, a: &Award) -> Result<ClaimReply> {
         let key = self.wbi_key()?;
+        let csrf = self.csrf();
         let query = signed_query(&[], &key, chrono::Utc::now().timestamp());
         let r=self.client.post(format!("{}/x/activity_components/mission/receive?{query}",self.base))
-            .header(COOKIE,&self.cookie).header(REFERER,"https://www.bilibili.com/").header(ORIGIN,"https://www.bilibili.com")
+            .header(REFERER,"https://www.bilibili.com/")
             .header(USER_AGENT,"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/144.0.0.0 Safari/537.36")
             .form(&[("task_id",a.task_id.as_str()),("activity_id",a.act_id.as_str()),("activity_name",a.act_name.as_str()),("task_name",a.task_name.as_str()),
-                ("reward_name",a.reward_name.as_str()),("gaia_vtoken",""),("receive_from","missionPage"),("csrf",self.csrf.as_str())]).send()?;
+                ("reward_name",a.reward_name.as_str()),("gaia_vtoken",""),("receive_from","missionPage"),("csrf",csrf.as_str())]).send()?;
         let status = r.status().as_u16();
         if !r.status().is_success() {
+            if let Ok(body) = r.json::<Value>() {
+                if let Some(message) = body["message"].as_str() {
+                    let message: String = message.chars().take(512).collect();
+                    if let Some(code) = body["code"].as_i64() {
+                        bail!("领取响应 HTTP {status}；{message} · {code}");
+                    }
+                    bail!("领取响应 HTTP {status}；{message}");
+                }
+            }
             bail!("领取响应 HTTP {status}");
         }
         Ok(interpret_claim(&r.json()?))
+    }
+    fn csrf(&self) -> String {
+        self.cookies
+            .cookies(&self.cookie_url)
+            .and_then(|header| {
+                header
+                    .to_str()
+                    .ok()
+                    .and_then(|s| cookie_value(s, "bili_jct"))
+            })
+            .unwrap_or_default()
     }
     pub fn history(&self, a: &Award) -> Result<Value> {
         let q = signed_query(
@@ -414,6 +441,105 @@ mod tests {
         );
     }
     #[test]
+    fn server_cookie_updates_are_reused_and_csrf_matches_after_a_failed_claim() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 2048];
+                let end = loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|p| p == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|s| {
+                        s.strip_prefix("content-length:")
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < end + length {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let cookie = headers
+                    .lines()
+                    .find_map(|s| s.strip_prefix("cookie: "))
+                    .unwrap();
+                assert_eq!(cookie_value(cookie, "sessdata").as_deref(), Some("test"));
+                if index > 0 {
+                    let csrf = if index == 3 { "after-failure" } else { "fresh" };
+                    assert_eq!(cookie_value(cookie, "bili_jct").as_deref(), Some(csrf));
+                    assert_eq!(
+                        cookie_value(cookie, "server-session").as_deref(),
+                        Some("updated")
+                    );
+                    if index >= 2 {
+                        assert!(
+                            headers.starts_with("post /x/activity_components/mission/receive?")
+                        );
+                        assert!(!headers.lines().any(|h| h.starts_with("origin:")));
+                        let form: BTreeMap<_, _> = url::form_urlencoded::parse(&bytes[end..])
+                            .into_owned()
+                            .collect();
+                        assert_eq!(form["csrf"], csrf);
+                    }
+                }
+                let (status, extra, value) = match index {
+                    0 => (
+                        200,
+                        "Set-Cookie: bili_jct=fresh; Path=/\r\nSet-Cookie: server-session=updated; Path=/\r\n",
+                        json!({"code":0,"data":{"isLogin":true,"uname":"测试","mid":1,"wbi_img":{"img_url":format!("https://x/{}.png", "a".repeat(32)),"sub_url":format!("https://x/{}.png", "b".repeat(32))}}}),
+                    ),
+                    1 => (
+                        200,
+                        "",
+                        json!({"code":0,"data":{"act_id":"act","act_name":"活动","task_name":"任务","reward_info":{"award_name":"奖励"}}}),
+                    ),
+                    2 => (
+                        429,
+                        "Set-Cookie: bili_jct=after-failure; Path=/\r\n",
+                        json!({"code":-702}),
+                    ),
+                    _ => (200, "", json!({"code":0})),
+                };
+                let body = value.to_string();
+                write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let api = Api::with_base(
+            "SESSDATA=test; bili_jct=initial",
+            &format!("http://{address}"),
+        )
+        .unwrap();
+        api.account().unwrap();
+        let award = api.award_info("task").unwrap();
+        assert!(
+            api.claim(&award)
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP 429")
+        );
+        assert_eq!(api.claim(&award).unwrap(), ClaimReply::Success(None));
+        server.join().unwrap();
+    }
+    #[test]
     fn http_flow_sends_cookie_csrf_and_signed_post() {
         use std::{
             io::{Read, Write},
@@ -442,7 +568,15 @@ mod tests {
                     }
                 }
                 let headers = String::from_utf8_lossy(&data[..header_end]).to_lowercase();
-                assert!(headers.contains("cookie: sessdata=test; bili_jct=csrf-token"));
+                let cookie = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("cookie: "))
+                    .unwrap();
+                assert_eq!(cookie_value(cookie, "sessdata").as_deref(), Some("test"));
+                assert_eq!(
+                    cookie_value(cookie, "bili_jct").as_deref(),
+                    Some("csrf-token")
+                );
                 let len = headers
                     .lines()
                     .find_map(|s| {

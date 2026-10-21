@@ -556,6 +556,11 @@ impl Desk {
         let events: Vec<_> = self.rx.try_iter().collect();
         let mut changed = false;
         for e in events {
+            if !self.demo {
+                if let Err(error) = shike::diagnostics::record(&self.dir, &self.store, &e) {
+                    self.notice = format!("保存运行日志失败：{error}");
+                }
+            }
             let id = e.task_id();
             if matches!(e, Event::Finished(_)) {
                 self.active.remove(&id);

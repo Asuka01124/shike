@@ -17,25 +17,38 @@ use std::{
 pub enum Event {
     Prepared(u64, String),
     Metadata(u64, PreparedAward),
+    PreparationError(u64, String),
     CoolingDown(u64, i64, u32),
     Waiting(u64),
     Started(u64),
     Attempt(u64, usize, u32),
+    AttemptResult(u64, AttemptResult),
     Message(u64, String),
     Archive(u64, String, Option<String>),
     Failed(u64, String),
     Paused(u64),
     Finished(u64),
 }
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AttemptResult {
+    pub worker: usize,
+    pub attempt: u32,
+    pub started_at_ms: i64,
+    pub elapsed_ms: u64,
+    pub code: Option<i64>,
+    pub message: String,
+}
 impl Event {
     pub fn task_id(&self) -> u64 {
         match self {
             Self::Prepared(id, _)
             | Self::Metadata(id, _)
+            | Self::PreparationError(id, _)
             | Self::CoolingDown(id, ..)
             | Self::Waiting(id)
             | Self::Started(id)
             | Self::Attempt(id, ..)
+            | Self::AttemptResult(id, ..)
             | Self::Message(id, _)
             | Self::Archive(id, ..)
             | Self::Failed(id, _)
@@ -82,8 +95,28 @@ pub fn run_workers(
                     break;
                 }
                 let next = Instant::now() + period;
+                let started_at_ms = chrono::Utc::now().timestamp_millis();
+                let started = Instant::now();
                 let _ = tx.send(Event::Attempt(id, worker, attempt));
-                match claim(worker, attempt) {
+                let response = claim(worker, attempt);
+                let (code, message) = match &response {
+                    Ok(ClaimReply::Success(_)) => (Some(0), "领取成功".into()),
+                    Ok(ClaimReply::Already) => (None, "此前已领取".into()),
+                    Ok(ClaimReply::Retry(code, message)) => (Some(*code), message.clone()),
+                    Err(error) => (None, format!("{error:#}")),
+                };
+                let _ = tx.send(Event::AttemptResult(
+                    id,
+                    AttemptResult {
+                        worker: worker + 1,
+                        attempt,
+                        started_at_ms,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        code,
+                        message,
+                    },
+                ));
+                match response {
                     Ok(ClaimReply::Success(cdkey)) => {
                         if done.swap(2, Ordering::AcqRel) != 2 {
                             let _ = tx.send(Event::Archive(id, "领取成功".into(), cdkey));
@@ -156,7 +189,7 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let Some(prepared) = prepare(&task, &api, &stop, &tx, &mut failures, || {
+            let Some(mut prepared) = prepare(&task, &api, &stop, &tx, &mut failures, || {
                 let (_, account_id) = api.account()?;
                 if task.owner_id == 0 || task.owner_id != account_id {
                     anyhow::bail!("请登录这份奖励所属的账号后再领取");
@@ -184,8 +217,8 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let award = prepared.award.clone();
-            let _ = tx.send(Event::Metadata(id, prepared));
+            let mut award = prepared.award.clone();
+            let _ = tx.send(Event::Metadata(id, prepared.clone()));
             let title = format!("{} · {}", award.task_name, award.reward_name);
             let _ = tx.send(Event::Prepared(id, title));
             if award.status == 6 {
@@ -206,12 +239,33 @@ pub fn start_with_api(task: Task, api: Api, tx: Sender<Event>) -> Arc<AtomicBool
                 }
                 let left = task.target * 1000 - chrono::Utc::now().timestamp_millis();
                 if left <= 15000 && !refreshed {
-                    if prepare(&task, &api, &stop, &tx, &mut failures, || {
-                        api.refresh_keys()
-                    })?
-                    .is_none()
-                    {
+                    let refreshed_award = prepare(&task, &api, &stop, &tx, &mut failures, || {
+                        api.refresh_keys()?;
+                        let age = chrono::Utc::now()
+                            .timestamp()
+                            .saturating_sub(prepared.fetched_at);
+                        if !(0..300).contains(&age) {
+                            Ok(PreparedAward {
+                                award: api.award_info(&task.task_id)?,
+                                fetched_at: chrono::Utc::now().timestamp(),
+                            })
+                        } else {
+                            Ok(prepared.clone())
+                        }
+                    })?;
+                    let Some(fresh) = refreshed_award else {
                         let _ = tx.send(Event::Paused(id));
+                        return Ok(());
+                    };
+                    prepared = fresh;
+                    award = prepared.award.clone();
+                    let _ = tx.send(Event::Metadata(id, prepared.clone()));
+                    let _ = tx.send(Event::Prepared(
+                        id,
+                        format!("{} · {}", award.task_name, award.reward_name),
+                    ));
+                    if award.status == 6 {
+                        let _ = tx.send(Event::Archive(id, "此前已领取".into(), None));
                         return Ok(());
                     }
                     let _ = tx.send(Event::Waiting(id));
@@ -300,6 +354,7 @@ fn prepare<T>(
         match action() {
             Ok(value) => return Ok(Some(value)),
             Err(error) => {
+                let _ = tx.send(Event::PreparationError(task.id, format!("{error:#}")));
                 let Some(limit) = error.downcast_ref::<PreparationLimit>() else {
                     return Err(error);
                 };
